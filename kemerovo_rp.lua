@@ -23,6 +23,10 @@ end
 -- НАСТРОЙКИ (можно менять)
 ------------------------------------------------------------------------
 local FONT = Enum.Font.SourceSansSemibold -- шрифт с кириллицей
+local STUDS_TO_KMH = 1.008 -- студы/сек -> км/ч (если спидометр игры показывает иначе, подправь)
+local PUSH_PER_POINT = 0.6 -- добавка к разгону на 1 единицу «Ускорения», студы/сек² (100 = 60)
+local MOTOR_SPEED_PER_POINT = 0.02 -- прибавка к скорости моторов колёс на 1 единицу «Макс. скорости» (100 = x3)
+local MOTOR_TORQUE_PER_POINT = 0.05 -- прибавка к моменту моторов на 1 единицу «Ускорения» (100 = x6)
 
 local COLOR_BODY = Color3.fromRGB(138, 142, 150)
 local COLOR_HEADER = Color3.fromRGB(116, 120, 128)
@@ -39,7 +43,8 @@ local state = {
 	boost = false,
 	susp = false,
 	height = 0, -- % к высоте пружин
-	accelPct = 200, -- ускорение разгона, % (200 = в 2 раза)
+	accel = 30, -- сила ускорения, 0-100
+	top = 40, -- сила максимальной скорости, 0-100 (0 = выкл)
 	stiff = 100, -- жёсткость, %
 	damp = 100, -- демпфирование, %
 }
@@ -127,6 +132,58 @@ local function restoreSprings(c)
 	c.touched = false
 end
 
+-- Моторы колёс: на время буста умножаем скорость и момент.
+-- Базовое значение берём заново каждый раз, когда игра сама его перезаписала.
+local function scaleProp(rec, inst, prop, mul)
+	local ok, cur = pcall(function()
+		return inst[prop]
+	end)
+	if not ok or type(cur) ~= "number" then
+		return
+	end
+	local slot = rec[prop]
+	if not slot then
+		slot = {}
+		rec[prop] = slot
+	end
+	if slot.written == nil or math.abs(cur - slot.written) > 1e-3 * math.max(1, math.abs(slot.written)) then
+		slot.base = cur
+	end
+	local base = slot.base
+	if base ~= base or math.abs(base) == math.huge then
+		return
+	end
+	local target = base * mul
+	if math.abs(target - cur) > 1e-6 then
+		pcall(function()
+			inst[prop] = target
+		end)
+	end
+	slot.written = target
+end
+
+local function applyMotors(c, active)
+	if not active and not c.motorsOn then
+		return
+	end
+	c.motorsOn = active
+	local sMul = active and (1 + state.top * MOTOR_SPEED_PER_POINT) or 1
+	local tMul = active and (1 + state.accel * MOTOR_TORQUE_PER_POINT) or 1
+	for _, m in ipairs(c.motors) do
+		if m.inst.Parent then
+			scaleProp(m.rec, m.inst, "AngularVelocity", sMul)
+			scaleProp(m.rec, m.inst, "MotorMaxTorque", tMul)
+			scaleProp(m.rec, m.inst, m.accelProp, tMul)
+		end
+	end
+end
+
+local function restoreMotors(c)
+	if c then
+		applyMotors(c, false)
+	end
+end
+
 local function refreshCar()
 	local seat = currentSeat()
 	if car and car.seat == seat then
@@ -134,6 +191,7 @@ local function refreshCar()
 	end
 	if car then
 		restoreSprings(car)
+		restoreMotors(car)
 		car = nil
 	end
 	if not seat then
@@ -155,8 +213,13 @@ local function refreshCar()
 		count = 0,
 		h = 1,
 		touched = false,
-		gain = 0,
+		motors = {},
+		motorsOn = false,
+		speed = 0,
+		prevSpeed = 0,
 		pushedAt = 0,
+		fwdSign = 1,
+		fwdKnown = false,
 	}
 	for _, d in ipairs(model:GetDescendants()) do
 		if d:IsA("SpringConstraint") then
@@ -169,7 +232,19 @@ local function refreshCar()
 				Damp = d.Damping,
 			}
 			c.count = c.count + 1
+		elseif d:IsA("HingeConstraint") then
+			if d.ActuatorType == Enum.ActuatorType.Motor then
+				c.motors[#c.motors + 1] = { inst = d, rec = {}, accelProp = "MotorMaxAcceleration" }
+			end
+		elseif d:IsA("CylindricalConstraint") then
+			if d.AngularActuatorType == Enum.ActuatorType.Motor then
+				c.motors[#c.motors + 1] = { inst = d, rec = {}, accelProp = "MotorMaxAngularAcceleration" }
+			end
 		end
+	end
+	local tv = model:FindFirstChild("Throttle", true)
+	if tv and (tv:IsA("NumberValue") or tv:IsA("IntValue")) then
+		c.throttleValue = tv
 	end
 	car = c
 end
@@ -212,43 +287,112 @@ end
 ------------------------------------------------------------------------
 -- БУСТЕР
 ------------------------------------------------------------------------
--- Ускорение разгона: замеряем, сколько скорости машина набрала сама за кадр,
--- и добавляем столько же (×2 = ещё одна такая же порция). Максималку не трогаем.
+-- Бустер:
+-- 1) прямая добавка скорости вдоль движения, пока зажат газ;
+-- 2) усиление моторов колёс (скорость и момент), чтобы игра не тормозила машину обратно.
+-- «Вперёд» определяем по реальному движению машины, а не по ориентации сиденья.
+local function lookFlat(seat)
+	local l = seat.CFrame.LookVector
+	local f = Vector3.new(l.X, 0, l.Z)
+	if f.Magnitude < 0.05 then
+		return nil
+	end
+	return f.Unit
+end
+
+local function camFlat()
+	local cam = workspace.CurrentCamera
+	if not cam then
+		return nil
+	end
+	local l = cam.CFrame.LookVector
+	local f = Vector3.new(l.X, 0, l.Z)
+	if f.Magnitude < 0.05 then
+		return nil
+	end
+	return f.Unit
+end
+
+local function throttleHeld(c)
+	if UserInputService:GetFocusedTextBox() then
+		return false
+	end
+	if c.seat:IsA("VehicleSeat") and c.seat.ThrottleFloat > 0.1 then
+		return true
+	end
+	if c.throttleValue and c.throttleValue.Parent and c.throttleValue.Value > 0.1 then
+		return true
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.W) or UserInputService:IsKeyDown(Enum.KeyCode.Up) then
+		return true
+	end
+	-- телефон / стик: движение вперёд относительно камеры
+	local char = LocalPlayer.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local cf = camFlat()
+	if hum and cf and hum.MoveDirection.Magnitude > 0.1 and hum.MoveDirection:Dot(cf) > 0.4 then
+		return true
+	end
+	return false
+end
+
 local function updateBoost(dt)
 	local c = car
 	local root = c.seat.AssemblyRootPart
 	if not root or root.Anchored then
-		c.expected = nil
+		c.speed = 0
+		applyMotors(c, false)
 		return
 	end
 
 	local vel = root.AssemblyLinearVelocity
 	local flat = Vector3.new(vel.X, 0, vel.Z)
 	local speed = flat.Magnitude
+	local accelerating = speed >= c.prevSpeed - 0.02
+	c.prevSpeed = speed
+	c.speed = speed
 
-	if c.expected == nil or dt > 0.1 then
-		c.expected = speed
-		c.gain = 0
+	if not state.boost then
+		applyMotors(c, false)
 		return
 	end
 
-	-- набор скорости без нашей добавки (студы/сек²), сглаженный
-	local gainPerSec = (speed - c.expected) / math.max(dt, 1 / 240)
-	c.gain = c.gain + (gainPerSec - c.gain) * math.min(1, dt * 12)
-	c.expected = speed
+	local throttle = throttleHeld(c)
+	applyMotors(c, throttle)
 
-	if not state.boost or speed < 0.5 then
+	local look = lookFlat(c.seat)
+	if not throttle or not look then
 		return
 	end
 
-	local extra = (state.accelPct / 100 - 1) * math.max(0, c.gain - 0.5)
-	extra = math.min(extra, 80)
-	if extra <= 0 then
+	-- где у этой машины «вперёд»: газ зажат, едем и набираем скорость
+	if speed > 4 and accelerating then
+		local d = (flat / speed):Dot(look)
+		if math.abs(d) > 0.6 then
+			c.fwdSign = d > 0 and 1 or -1
+			c.fwdKnown = true
+		end
+	end
+	if not c.fwdKnown or state.accel <= 0 then
 		return
 	end
 
-	root:ApplyImpulse((flat / speed) * root.AssemblyMass * extra * dt)
-	c.expected = speed + extra * dt
+	local dir
+	if speed > 2 then
+		dir = flat / speed
+		if dir:Dot(look) * c.fwdSign < 0.3 then
+			return -- едем не вперёд (задний ход, занос)
+		end
+	else
+		dir = look * c.fwdSign
+	end
+
+	local cap = (80 + state.top * 3.2) / STUDS_TO_KMH -- 100 = около 400 км/ч
+	if speed >= cap then
+		return
+	end
+	local taper = math.clamp((cap - speed) / (cap * 0.1), 0, 1)
+	root.AssemblyLinearVelocity = vel + dir * (state.accel * PUSH_PER_POINT * taper * dt)
 	c.pushedAt = os.clock()
 end
 
@@ -259,6 +403,13 @@ connect(RunService.Heartbeat, function(dt)
 	end
 	updateSprings(dt)
 	updateBoost(dt)
+end)
+
+connect(RunService.Stepped, function()
+	local c = car
+	if c and c.motorsOn and state.boost then
+		applyMotors(c, true)
+	end
 end)
 
 ------------------------------------------------------------------------
@@ -604,6 +755,55 @@ local function makeSlider(page, y, titleText, minV, maxV, initV, suffix, onChang
 	return { set = setValue }
 end
 
+-- поле ввода числа 0-100
+local function makeField(page, y, labelText, initV, onChange)
+	local lbl = newInstance("TextLabel", {
+		Position = UDim2.fromOffset(0, y),
+		Size = UDim2.new(1, -80, 0, 28),
+		BackgroundTransparency = 1,
+		Text = labelText,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, page)
+	styleText(lbl, 18)
+
+	local box = newInstance("TextBox", {
+		Position = UDim2.new(1, -70, 0, y + 1),
+		Size = UDim2.fromOffset(70, 26),
+		BackgroundColor3 = COLOR_WHITE,
+		BackgroundTransparency = 0.82,
+		Text = tostring(initV),
+		PlaceholderText = "0-100",
+		PlaceholderColor3 = Color3.fromRGB(225, 225, 225),
+		ClearTextOnFocus = false,
+	}, page)
+	styleText(box, 18)
+	corner(box, 6)
+	outline(box, 1.5)
+
+	local value = initV
+
+	-- пока печатаешь: только цифры, не больше трёх
+	connect(box:GetPropertyChangedSignal("Text"), function()
+		local clean = box.Text:gsub("%D", "")
+		if #clean > 3 then
+			clean = clean:sub(1, 3)
+		end
+		if clean ~= box.Text then
+			box.Text = clean
+		end
+	end)
+
+	-- когда закончил: число зажимается в 0-100, пустое возвращает прежнее
+	connect(box.FocusLost, function()
+		local n = tonumber(box.Text)
+		if n then
+			value = math.clamp(math.floor(n + 0.5), 0, 100)
+			onChange(value)
+		end
+		box.Text = tostring(value)
+	end)
+end
+
 -- белая кнопка
 local function makeButton(parent, text, pos, size, onClick)
 	local b = newInstance("TextButton", {
@@ -657,11 +857,14 @@ local statusPneumo = makeInfo(pagePneumo, 128, 20, 15)
 -- вкладка 2: БУСТЕР
 local pageBoost = newTab(2, "БУСТЕР")
 makeToggle(pageBoost, 0, "Бустер", "boost")
-makeSlider(pageBoost, 38, "Разгон", 120, 400, state.accelPct, "%", function(v)
-	state.accelPct = v
+makeField(pageBoost, 40, "Ускорение", state.accel, function(v)
+	state.accel = v
 end)
-local boostStatus = makeInfo(pageBoost, 92, 20, 16)
-makeInfo(pageBoost, 114, 36, 14).Text = "Ускоряет разгон машины. Максимальную скорость не меняет."
+makeField(pageBoost, 76, "Макс. скорость", state.top, function(v)
+	state.top = v
+end)
+makeInfo(pageBoost, 110, 18, 14).Text = "Число 0–100. Макс. скорость 100 ≈ 400 км/ч"
+local boostStatus = makeInfo(pageBoost, 132, 18, 15)
 
 -- вкладка 3: Подвеска
 local pageSusp = newTab(3, "Подвеска")
@@ -684,9 +887,19 @@ task.spawn(function()
 		statusPneumo.Text = msg
 		statusSusp.Text = msg
 
-		local boostMsg = ""
-		if car and state.boost then
-			boostMsg = (os.clock() - car.pushedAt < 0.3) and "Разгон применяется" or "Жми газ"
+		local boostMsg = "Сядь в машину"
+		if car then
+			local mode
+			if not state.boost then
+				mode = "выкл"
+			elseif os.clock() - car.pushedAt < 0.3 then
+				mode = "буст"
+			elseif not car.fwdKnown then
+				mode = "едь вперёд"
+			else
+				mode = "жми газ"
+			end
+			boostMsg = string.format("%d км/ч | моторов %d | %s", math.floor(car.speed * STUDS_TO_KMH + 0.5), #car.motors, mode)
 		end
 		boostStatus.Text = boostMsg
 		task.wait(0.25)
@@ -705,6 +918,7 @@ env.KRP_Cleanup = function()
 	end
 	if car then
 		restoreSprings(car)
+		restoreMotors(car)
 		car = nil
 	end
 	gui:Destroy()
